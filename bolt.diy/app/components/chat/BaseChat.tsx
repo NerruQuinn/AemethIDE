@@ -338,11 +338,14 @@ export const BaseChat = React.forwardRef<HTMLDivElement, BaseChatProps>(
         <div className="flex flex-col lg:flex-row overflow-y-auto w-full h-full">
           <div className={classNames(styles.Chat, 'flex flex-col flex-grow lg:min-w-[var(--chat-min-width)] h-full')}>
             {!chatStarted && (
-              <div id="intro" className="mt-[16vh] max-w-chat mx-auto text-center px-4 lg:px-0">
-                <h1 className="text-3xl lg:text-6xl font-bold text-bolt-elements-textPrimary mb-4 animate-fade-in">
-                  Aemeth Here, Let's build Something!
+              <div
+                id="intro"
+                className="mt-[6vh] sm:mt-[10vh] lg:mt-[16vh] max-w-chat mx-auto text-center px-4 sm:px-6 lg:px-0"
+              >
+                <h1 className="text-[26px] leading-tight sm:text-4xl lg:text-6xl font-bold text-bolt-elements-textPrimary mb-3 sm:mb-4 animate-fade-in">
+                  <span className="text-bolt-elements-item-contentAccent">Aemeth</span> Here, Let's build Something!
                 </h1>
-                <p className="text-md lg:text-xl mb-8 text-bolt-elements-textSecondary animate-fade-in animation-delay-200">
+                <p className="text-sm sm:text-lg lg:text-xl mb-8 text-bolt-elements-textSecondary animate-fade-in animation-delay-200">
                   Bring your ideas to life or get help on your existing projects.
                 </p>
               </div>
@@ -585,7 +588,7 @@ export const BaseChat = React.forwardRef<HTMLDivElement, BaseChatProps>(
                         />
                       )}
                     </ClientOnly>
-                    <div className="flex justify-between items-center text-sm p-4 pt-2">
+                    <div className="flex flex-wrap justify-between items-center gap-x-2 gap-y-1 text-sm px-3 sm:px-4 pt-2 pb-3 sm:pb-4">
                       <div className="flex gap-1 items-center">
                         <IconButton title="Upload file" className="transition-all" onClick={() => handleFileUpload()}>
                           <div className="i-ph:paperclip text-xl"></div>

@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/react';
-import { memo, useMemo } from 'react';
+import { memo, useEffect, useMemo, useRef } from 'react';
 import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels';
 import * as Tabs from '@radix-ui/react-tabs';
 import {
@@ -62,6 +62,22 @@ export const EditorPanel = memo(
 
     const theme = useStore(themeStore);
     const showTerminal = useStore(workbenchStore.showTerminal);
+    const terminalViewportInitialized = useRef(false);
+
+    useEffect(() => {
+      /*
+       * On small viewports start with the terminal collapsed so the code editor
+       * keeps the limited vertical space. It stays available via the
+       * "Toggle Terminal" header action once the workbench is open.
+       */
+      if (!terminalViewportInitialized.current) {
+        terminalViewportInitialized.current = true;
+
+        if (typeof window !== 'undefined' && window.innerWidth < 1024) {
+          workbenchStore.showTerminal.set(false);
+        }
+      }
+    }, []);
 
     const activeFileSegments = useMemo(() => {
       if (!editorDocument) {

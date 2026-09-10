@@ -6,33 +6,27 @@
 @use 'components/code.scss';
 @use 'components/editor.scss';
 @use 'components/toast.scss';
-
 html,
 body {
   height: 100%;
   width: 100%;
 }
-
 :root {
   --gradient-opacity: 0.5;
   --primary-color: rgba(56, 189, 248, var(--gradient-opacity));
   --secondary-color: rgba(45, 212, 191, var(--gradient-opacity));
   --accent-color: rgba(96, 165, 250, var(--gradient-opacity));
 }
-
 .modern-scrollbar {
   overflow: auto;
-
   // WebKit scrollbar styling
   &::-webkit-scrollbar {
     width: 2px;
     height: 4px;
   }
-
   &::-webkit-scrollbar-track {
     background: transparent;
   }
-
   &::-webkit-scrollbar-thumb {
     // Use CSS variables for colors
     background-color: var(--modern-scrollbar-thumb-background);
@@ -41,29 +35,75 @@ body {
     background-clip: content-box;
     transition: background-color 0.2s ease-in-out; // Add transition
   }
-
   &::-webkit-scrollbar-thumb:hover {
     // Use CSS variable for hover color
     background-color: var(--modern-scrollbar-thumb-backgroundHover);
   }
-
   // Firefox support
   scrollbar-width: thin;
   // Use CSS variables for Firefox colors
   scrollbar-color: var(--modern-scrollbar-thumb-backgroundHover) transparent; // Use hover color for thumb for consistency
 }
-
 .modern-scrollbar-invert {
   &::-webkit-scrollbar-thumb {
     // Override with a contrasting color, e.g., primary text color with transparency
     background-color: color-mix(in srgb, var(--bolt-elements-textPrimary), transparent 70%);
   }
-
   &::-webkit-scrollbar-thumb:hover {
     // Darker/more opaque version on hover
     background-color: color-mix(in srgb, var(--bolt-elements-textPrimary), transparent 50%);
   }
-
   // Firefox support for inverted colors
   scrollbar-color: color-mix(in srgb, var(--bolt-elements-textPrimary), transparent 50%) transparent;
+}
+/*
+ * ============================================================================
+ * Responsive & touch optimizations (tablet / phone / general small viewports)
+ * ============================================================================
+ */
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+button,
+[role='button'],
+input,
+select,
+textarea {
+  -webkit-tap-highlight-color: transparent;
+}
+button,
+[role='button'] {
+  touch-action: manipulation;
+}
+/*
+ * Below the `lg` (1024px) breakpoint the app runs in a single-column layout:
+ * chat and workbench stack instead of sitting side by side, so the desktop
+ * sizing variables must give up the reserved chat column.
+ */
+@media (max-width: 1023.98px) {
+  :root {
+    --chat-min-width: 0px;
+    --workbench-width: 100%;
+    --workbench-inner-width: 100%;
+    --workbench-left: 0px;
+  }
+}
+/*
+ * iOS zooms the page when a focused input/textarea is smaller than 16px.
+ * Normalizing to 16px on phones avoids the accidental zoom-on-focus jump.
+ */
+@media (max-width: 767.98px) {
+  input,
+  textarea,
+  select {
+    font-size: 16px;
+  }
+  /*
+   * xterm manages its own hidden helper textarea and caret metrics; keep its
+   * font-size untouched so terminal rendering stays aligned.
+   */
+  textarea.xterm-helper-textarea {
+    font-size: inherit;
+  }
 }

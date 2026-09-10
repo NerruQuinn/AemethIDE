@@ -45,3 +45,15 @@
   fill: url(#shine-gradient);
   mix-blend-mode: overlay;
 }
+
+/*
+ * Keep the composer at 16px on phones so iOS Safari does not zoom into the
+ * page when the textarea receives focus.
+ */
+@media (max-width: 767.98px) {
+  .Chat {
+    textarea {
+      font-size: 16px;
+    }
+  }
+}
