@@ -1,6 +1,7 @@
 import { useStore } from '@nanostores/react';
 import { useCallback, useEffect, useState } from 'react';
 import { toast } from 'react-toastify';
+import { scheduleCloudPush } from '~/lib/persistence/cloudSync';
 import {
   chatId as chatIdStore,
   db,
@@ -129,6 +130,7 @@ export function useEditChatDescription({
         }
 
         await updateChatDescription(db, chatId, currentDescription);
+        scheduleCloudPush(chatId);
 
         if (syncWithGlobalStore) {
           descriptionStore.set(currentDescription);

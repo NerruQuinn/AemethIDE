@@ -7,6 +7,10 @@ import { ControlPanel } from '~/components/@settings/core/ControlPanel';
 import { SettingsButton } from '~/components/ui/SettingsButton';
 import { Button } from '~/components/ui/Button';
 import { db, deleteById, getAll, chatId, type ChatHistoryItem, useChatHistory } from '~/lib/persistence';
+import { AuthMenu } from '~/components/auth/AuthMenu.client';
+import { cancelCloudPush, deleteChatOnCloud, syncAll } from '~/lib/persistence/cloudSync';
+import { authStore, hydrateAuth } from '~/lib/stores/auth';
+import { selectForScope } from '~/lib/persistence/historyScope';
 import { cubicEasingFn } from '~/utils/easings';
 import { HistoryItem } from './HistoryItem';
 import { binDates } from './date-binning';
@@ -14,6 +18,9 @@ import { useSearchFilter } from '~/lib/hooks/useSearchFilter';
 import { classNames } from '~/utils/classNames';
 import { useStore } from '@nanostores/react';
 import { profileStore } from '~/lib/stores/profile';
+import { sidebarStore } from '~/lib/stores/sidebar';
+import useViewport from '~/lib/hooks';
+import { useLocation } from '@remix-run/react';
 
 const menuVariants = {
   closed: {
@@ -67,26 +74,91 @@ export const Menu = () => {
   const { duplicateCurrentChat, exportChat } = useChatHistory();
   const menuRef = useRef<HTMLDivElement>(null);
   const [list, setList] = useState<ChatHistoryItem[]>([]);
-  const [open, setOpen] = useState(false);
+  const open = useStore(sidebarStore);
+  const isSmallViewport = useViewport(1024);
+  const location = useLocation();
   const [dialogContent, setDialogContent] = useState<DialogContent>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const profile = useStore(profileStore);
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedItems, setSelectedItems] = useState<string[]>([]);
 
+  // Reactive auth session. While it is still hydrating ('loading') the active
+  // history scope is unknown, so no history may be rendered (a previous user's
+  // or guest's records must never flash in).
+  const auth = useStore(authStore);
+  const scopeReady = auth.status !== 'loading';
+  const authScope: { kind: 'guest' } | { kind: 'user'; userId: string } =
+    auth.status === 'authenticated' && auth.user?.id ? { kind: 'user', userId: auth.user.id } : { kind: 'guest' };
+  const scopeKey = authScope.kind === 'user' ? `user:${authScope.userId}` : 'guest';
+  const prevScopeKeyRef = useRef<string | null>(null);
+
   const { filteredItems: filteredList, handleSearchChange } = useSearchFilter({
     items: list,
     searchFields: ['description'],
   });
 
-  const loadEntries = useCallback(() => {
-    if (db) {
-      getAll(db)
-        .then((list) => list.filter((item) => item.urlId && item.description))
-        .then(setList)
-        .catch((error) => toast.error(error.message));
+  // Load only the chat records that belong to the currently active scope.
+  const loadEntries = useCallback(async () => {
+    if (!db || authStore.get().status === 'loading') {
+      setList([]);
+      return;
+    }
+
+    const state = authStore.get();
+    const scope: { kind: 'guest' } | { kind: 'user'; userId: string } =
+      state.status === 'authenticated' && state.user?.id ? { kind: 'user', userId: state.user.id } : { kind: 'guest' };
+
+    try {
+      const all = await getAll(db);
+      const scoped = selectForScope(all, scope);
+      setList(scoped.filter((item) => item.urlId && item.description));
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error));
     }
   }, []);
+
+  // Whenever the active scope changes (guest <-> account, or account -> other
+  // account), immediately drop the previously rendered history, then load the
+  // correct scope. Authenticated scopes force a full cloud sync + first-login
+  // guest migration before the list is rebuilt.
+  useEffect(() => {
+    if (scopeKey === prevScopeKeyRef.current) {
+      return;
+    }
+
+    const previousKey = prevScopeKeyRef.current;
+    prevScopeKeyRef.current = scopeKey;
+
+    setList([]);
+    setSelectedItems([]);
+    setSelectionMode(false);
+
+    if (!scopeReady) {
+      return; // still hydrating; the scope effect below runs again when known
+    }
+
+    if (scopeKey === 'guest') {
+      if (previousKey?.startsWith('user:')) {
+        // Signed out while an account chat was open: leave the chat page so the
+        // previous user's conversation is never left visible as guest content.
+        if (window.location.pathname.startsWith('/chat/')) {
+          window.location.pathname = '/';
+          return;
+        }
+      }
+
+      void loadEntries();
+      return;
+    }
+
+    // Account login / switch: sync + migrate first, then render.
+    void syncAll(true)
+      .catch((error) => console.warn('[history] initial account sync failed', error))
+      .finally(() => {
+        void loadEntries();
+      });
+  }, [scopeKey, scopeReady, loadEntries]);
 
   const deleteChat = useCallback(
     async (id: string): Promise<void> => {
@@ -105,6 +177,14 @@ export const Menu = () => {
 
       // Delete the chat from the database
       await deleteById(db, id);
+
+      // Cloud tombstone (best-effort) so other devices remove this chat too.
+      cancelCloudPush(id);
+
+      if (authStore.get().status === 'authenticated') {
+        deleteChatOnCloud(id).catch((error) => console.warn('[cloudSync] delete failed', id, error));
+      }
+
       console.log('Successfully deleted chat:', id);
     },
     [db],
@@ -261,11 +341,45 @@ export const Menu = () => {
     });
   }, [filteredList]); // Depends only on filteredList
 
-  useEffect(() => {
-    if (open) {
-      loadEntries();
+  const refreshAfterSync = useCallback(() => {
+    if (db) {
+      void loadEntries();
     }
-  }, [open, loadEntries]);
+  }, [loadEntries]);
+
+  // Opening the sidebar refreshes the current scope from IndexedDB and pulls
+  // newer cloud state when an account is active.
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+
+    void loadEntries();
+
+    if (authStore.get().status === 'authenticated') {
+      void syncAll().then(refreshAfterSync);
+    }
+  }, [open, loadEntries, refreshAfterSync]);
+
+  // Hydrate the server session once when the sidebar first mounts.
+  useEffect(() => {
+    void hydrateAuth();
+  }, []);
+
+  // Refreshing: returning focus to the window pulls any newer cloud state.
+  useEffect(() => {
+    const onFocus = () => {
+      if (authStore.get().status === 'authenticated') {
+        void syncAll().then(refreshAfterSync);
+      }
+    };
+
+    window.addEventListener('focus', onFocus);
+
+    return () => {
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [refreshAfterSync]);
 
   // Exit selection mode when sidebar is closed
   useEffect(() => {
@@ -288,11 +402,11 @@ export const Menu = () => {
       }
 
       if (event.pageX < enterThreshold) {
-        setOpen(true);
+        sidebarStore.set(true);
       }
 
       if (menuRef.current && event.clientX > menuRef.current.getBoundingClientRect().right + exitThreshold) {
-        setOpen(false);
+        sidebarStore.set(false);
       }
     }
 
@@ -310,12 +424,34 @@ export const Menu = () => {
 
   const handleSettingsClick = () => {
     setIsSettingsOpen(true);
-    setOpen(false);
+    sidebarStore.set(false);
   };
 
   const handleSettingsClose = () => {
     setIsSettingsOpen(false);
   };
+
+  /*
+   * Close the drawer after any client-side navigation and on Escape. Touch
+   * users have no cursor edge-hover to dismiss it.
+   */
+  useEffect(() => {
+    sidebarStore.set(false);
+  }, [location.pathname]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (open && event.key === 'Escape') {
+        sidebarStore.set(false);
+      }
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [open]);
 
   const setDialogContentWithLogging = useCallback((content: DialogContent) => {
     console.log('Setting dialog content:', content);
@@ -324,12 +460,19 @@ export const Menu = () => {
 
   return (
     <>
+      {open && isSmallViewport && (
+        <div
+          className="fixed inset-0 z-[996] bg-black/40"
+          aria-hidden="true"
+          onClick={() => sidebarStore.set(false)}
+        />
+      )}
       <motion.div
         ref={menuRef}
         initial="closed"
         animate={open ? 'open' : 'closed'}
         variants={menuVariants}
-        style={{ width: '340px' }}
+        style={{ width: 'min(340px, 88vw)' }}
         className={classNames(
           'flex selection-accent flex-col side-menu fixed top-0 h-full',
           'bg-white dark:bg-gray-950 border-r border-gray-100 dark:border-gray-800/50',
@@ -338,7 +481,9 @@ export const Menu = () => {
         )}
       >
         <div className="h-12 flex items-center justify-between px-4 border-b border-gray-100 dark:border-gray-800/50 bg-gray-50/50 dark:bg-gray-900/50">
-          <div className="text-gray-900 dark:text-white font-medium"></div>
+          <div className="flex items-center gap-2 min-w-0">
+            <AuthMenu onAuthStateChanged={refreshAfterSync} />
+          </div>
           <div className="flex items-center gap-3">
             <span className="font-medium text-sm text-gray-900 dark:text-white truncate">
               {profile?.username || 'Guest User'}

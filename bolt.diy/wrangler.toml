@@ -4,3 +4,11 @@ compatibility_flags = ["nodejs_compat"]
 compatibility_date = "2025-03-28"
 pages_build_output_dir = "./build/client"
 send_metrics = false
+
+# Cloudflare D1 database used for Phase 1 auth + conversation sync.
+# database_id is a placeholder for local development. Before deploying, replace it
+# with the real database id: `wrangler d1 create bolt-d1` prints it.
+[[d1_databases]]
+binding = "DB"
+database_name = "bolt-d1"
+database_id = "10996d63-4d83-4cae-92ff-e2da8542cacf"

@@ -4,8 +4,8 @@ import { classNames } from '~/utils/classNames';
 import { AssistantMessage } from './AssistantMessage';
 import { UserMessage } from './UserMessage';
 import { useLocation } from '@remix-run/react';
-import { db, chatId } from '~/lib/persistence/useChatHistory';
-import { forkChat } from '~/lib/persistence/db';
+import { chatId } from '~/lib/persistence/useChatHistory';
+import { db, forkChat } from '~/lib/persistence/db';
 import { toast } from 'react-toastify';
 import { useStore } from '@nanostores/react';
 import { profileStore } from '~/lib/stores/profile';
@@ -62,7 +62,7 @@ export const Messages = forwardRef<HTMLDivElement, MessagesProps>(
               return (
                 <div
                   key={index}
-                  className={classNames('flex gap-4 p-6 py-5 w-full rounded-[calc(0.75rem-1px)]', {
+                  className={classNames('flex gap-3 sm:gap-4 px-3 sm:px-6 py-4 sm:py-5 w-full rounded-[calc(0.75rem-1px)]', {
                     'bg-bolt-elements-messages-background': isUserMessage || !isStreaming || (isStreaming && !isLast),
                     'bg-gradient-to-b from-bolt-elements-messages-background from-30% to-transparent':
                       isStreaming && isLast,

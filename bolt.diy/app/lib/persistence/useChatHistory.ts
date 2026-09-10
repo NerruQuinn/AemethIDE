@@ -1,15 +1,19 @@
 import { useLoaderData, useNavigate, useSearchParams } from '@remix-run/react';
 import { useState, useEffect, useCallback } from 'react';
 import { atom } from 'nanostores';
+import { useStore } from '@nanostores/react';
 import { generateId, type JSONValue, type Message } from 'ai';
 import { toast } from 'react-toastify';
 import { workbenchStore } from '~/lib/stores/workbench';
 import { logStore } from '~/lib/stores/logs'; // Import logStore
+import { scheduleCloudPush } from './cloudSync';
+import { authStore } from '~/lib/stores/auth';
+import { itemInScope, resolveHistoryListState } from './historyScope';
 import {
+  db,
   getMessages,
-  getNextId,
   getUrlId,
-  openDatabase,
+  newChatId,
   setMessages,
   duplicateChat,
   createChatFromMessages,
@@ -30,11 +34,17 @@ export interface ChatHistoryItem {
   messages: Message[];
   timestamp: string;
   metadata?: IChatMetadata;
+  /**
+   * Local ownership scope. Absent on records written before account scoping;
+   * those are always read as guest-owned (see historyScope.ts).
+   */
+  ownerType?: 'guest' | 'user';
+  ownerId?: string | null;
+  /** Guest records: the user ids this chat has been migrated/copied into. */
+  migratedTo?: string[];
 }
 
 const persistenceEnabled = !import.meta.env.VITE_DISABLE_PERSISTENCE;
-
-export const db = persistenceEnabled ? await openDatabase() : undefined;
 
 export const chatId = atom<string | undefined>(undefined);
 export const description = atom<string | undefined>(undefined);
@@ -43,6 +53,18 @@ export function useChatHistory() {
   const navigate = useNavigate();
   const { id: mixedId } = useLoaderData<{ id?: string }>();
   const [searchParams] = useSearchParams();
+  const auth = useStore(authStore);
+
+  // Which history scope may be rendered right now. 'loading' means the Better
+  // Auth session has not resolved yet - in that window no history is rendered.
+  const historyState = resolveHistoryListState(auth.status, auth.user?.id ?? null);
+  const scopeKey = historyState.kind === 'user' ? `user:${historyState.userId}` : historyState.kind;
+  const activeScope: { kind: 'guest' } | { kind: 'user'; userId: string } | null =
+    historyState.kind === 'loading'
+      ? null
+      : historyState.kind === 'user'
+        ? historyState
+        : { kind: 'guest' };
 
   const [archivedMessages, setArchivedMessages] = useState<Message[]>([]);
   const [initialMessages, setInitialMessages] = useState<Message[]>([]);
@@ -62,14 +84,33 @@ export function useChatHistory() {
       return;
     }
 
-    if (mixedId) {
-      Promise.all([
-        getMessages(db, mixedId),
-        getSnapshot(db, mixedId), // Fetch snapshot from DB
-      ])
-        .then(async ([storedMessages, snapshot]) => {
-          if (storedMessages && storedMessages.messages.length > 0) {
-            /*
+    if (!mixedId) {
+      // Brand-new chat (no history id in the URL).
+      setReady(true);
+      return;
+    }
+
+    // Never load history before the auth scope is known, and never load a
+    // conversation that belongs to a different scope (previous user/guest).
+    if (!activeScope) {
+      return;
+    }
+
+    Promise.all([
+      getMessages(db, mixedId),
+      getSnapshot(db, mixedId), // Fetch snapshot from DB
+    ])
+      .then(async ([storedMessages, snapshot]) => {
+        if (storedMessages && storedMessages.messages.length > 0) {
+          if (!itemInScope(storedMessages, activeScope)) {
+            console.warn(
+              `[useChatHistory] chat "${mixedId}" does not belong to the current history scope; not restoring it.`,
+            );
+            navigate('/', { replace: true });
+            return;
+          }
+
+          /*
              * const snapshotStr = localStorage.getItem(`snapshot:${mixedId}`); // Remove localStorage usage
              * const snapshot: Snapshot = snapshotStr ? JSON.parse(snapshotStr) : { chatIndex: 0, files: {} }; // Use snapshot from DB
              */
@@ -83,7 +124,12 @@ export function useChatHistory() {
               : storedMessages.messages.length;
             const snapshotIndex = storedMessages.messages.findIndex((m) => m.id === validSnapshot.chatIndex);
 
-            if (snapshotIndex >= 0 && snapshotIndex < endingIdx) {
+            if (
+              snapshotIndex >= 0 &&
+              snapshotIndex < endingIdx &&
+              snapshot &&
+              Object.keys(snapshot.files || {}).length > 0
+            ) {
               startingIdx = snapshotIndex;
             }
 
@@ -181,6 +227,7 @@ ${value.content}
             chatMetadata.set(storedMessages.metadata);
           } else {
             navigate('/', { replace: true });
+            return;
           }
 
           setReady(true);
@@ -190,12 +237,9 @@ ${value.content}
 
           logStore.logError('Failed to load chat messages or snapshot', error); // Updated error message
           toast.error('Failed to load chat: ' + error.message); // More specific error
+          setReady(true);
         });
-    } else {
-      // Handle case where there is no mixedId (e.g., new chat)
-      setReady(true);
-    }
-  }, [mixedId, db, navigate, searchParams]); // Added db, navigate, searchParams dependencies
+  }, [mixedId, db, navigate, searchParams, scopeKey]); // scopeKey: reload once the auth scope is known or changes
 
   const takeSnapshot = useCallback(
     async (chatIdx: string, files: FileMap, _chatId?: string | undefined, chatSummary?: string) => {
@@ -268,6 +312,7 @@ ${value.content}
       try {
         await setMessages(db, id, initialMessages, urlId, description.get(), undefined, metadata);
         chatMetadata.set(metadata);
+        scheduleCloudPush(id);
       } catch (error) {
         toast.error('Failed to update chat metadata');
         console.error(error);
@@ -313,7 +358,7 @@ ${value.content}
 
       // Ensure chatId.get() is used here as well
       if (initialMessages.length === 0 && !chatId.get()) {
-        const nextId = await getNextId(db);
+        const nextId = newChatId();
 
         chatId.set(nextId);
 
@@ -341,6 +386,9 @@ ${value.content}
         undefined,
         chatMetadata.get(),
       );
+
+      // Cloud sync (background, best-effort). Never blocks chat persistence.
+      scheduleCloudPush(finalChatId);
     },
     duplicateCurrentChat: async (listItemId: string) => {
       if (!db || (!mixedId && !listItemId)) {
@@ -349,6 +397,7 @@ ${value.content}
 
       try {
         const newId = await duplicateChat(db, mixedId || listItemId);
+        scheduleCloudPush(newId);
         navigate(`/chat/${newId}`);
         toast.success('Chat duplicated successfully');
       } catch (error) {

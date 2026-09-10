@@ -3,6 +3,7 @@ import type { LinksFunction } from '@remix-run/cloudflare';
 import { Links, Meta, Outlet, Scripts, ScrollRestoration } from '@remix-run/react';
 import tailwindReset from '@unocss/reset/tailwind-compat.css?url';
 import { themeStore } from './lib/stores/theme';
+import { hydrateAuth } from './lib/stores/auth';
 import { stripIndents } from './utils/stripIndent';
 import { createHead } from 'remix-island';
 import { useEffect } from 'react';
@@ -85,6 +86,16 @@ import { logStore } from './lib/stores/logs';
 
 export default function App() {
   const theme = useStore(themeStore);
+
+  /*
+   * Resolve the server auth session once at startup, on every route. The chat
+   * history hook waits for a known scope before it will render a chat page, and
+   * the only other hydrateAuth() call lives in the sidebar - which itself only
+   * mounts after the chat page has rendered. Hydrating here breaks that cycle.
+   */
+  useEffect(() => {
+    void hydrateAuth();
+  }, []);
 
   useEffect(() => {
     logStore.logSystem('Application initialized', {

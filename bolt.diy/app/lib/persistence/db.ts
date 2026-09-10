@@ -1,5 +1,7 @@
 import type { Message } from 'ai';
 import { createScopedLogger } from '~/utils/logger';
+import { authStore } from '~/lib/stores/auth';
+import type { ChatOwnerType } from './historyScope';
 import type { ChatHistoryItem } from './useChatHistory';
 import type { Snapshot } from './types'; // Import Snapshot type
 
@@ -11,6 +13,20 @@ export interface IChatMetadata {
 
 const logger = createScopedLogger('ChatHistory');
 
+/**
+ * Generates a globally unique chat id for NEW conversations so ids cannot
+ * collide across devices. Existing (numeric) ids stay untouched.
+ */
+export function newChatId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}-${Math.random()
+    .toString(36)
+    .slice(2, 10)}`;
+}
+
 // this is used at the top level and never rejects
 export async function openDatabase(): Promise<IDBDatabase | undefined> {
   if (typeof indexedDB === 'undefined') {
@@ -19,7 +35,11 @@ export async function openDatabase(): Promise<IDBDatabase | undefined> {
   }
 
   return new Promise((resolve) => {
-    const request = indexedDB.open('boltHistory', 2);
+    // v3: local chat + snapshot records carry account ownership fields
+    // (ownerType/ownerId, see historyScope.ts). Records written before v3 have
+    // no owner fields and are treated as guest-owned by every read helper, so
+    // no one-time data rewrite is required.
+    const request = indexedDB.open('boltHistory', 3);
 
     request.onupgradeneeded = (event: IDBVersionChangeEvent) => {
       const db = (event.target as IDBOpenDBRequest).result;
@@ -38,6 +58,8 @@ export async function openDatabase(): Promise<IDBDatabase | undefined> {
           db.createObjectStore('snapshots', { keyPath: 'chatId' });
         }
       }
+      // oldVersion < 3: no structural change; ownership is record-level and
+      // defaults to guest when the fields are absent.
     };
 
     request.onsuccess = (event: Event) => {
@@ -51,6 +73,30 @@ export async function openDatabase(): Promise<IDBDatabase | undefined> {
   });
 }
 
+/**
+ * The ownership to stamp onto a brand-new local record: the currently active
+ * account when an authenticated user creates the chat, guest otherwise.
+ * Existing records keep their original owner (see setMessages).
+ */
+export function currentChatOwner(): { ownerType: ChatOwnerType; ownerId: string | null } {
+  const state = authStore.get();
+
+  if (state.status === 'authenticated' && state.user?.id) {
+    return { ownerType: 'user', ownerId: state.user.id };
+  }
+
+  return { ownerType: 'guest', ownerId: null };
+}
+
+const persistenceEnabled = !import.meta.env.VITE_DISABLE_PERSISTENCE;
+
+/**
+ * The shared IndexedDB handle for local chat persistence. Lives here (not in
+ * the hook module) so both chat history code and the cloud-sync layer can open
+ * and reference one database.
+ */
+export const db = persistenceEnabled ? await openDatabase() : undefined;
+
 export async function getAll(db: IDBDatabase): Promise<ChatHistoryItem[]> {
   return new Promise((resolve, reject) => {
     const transaction = db.transaction('chats', 'readonly');
@@ -62,6 +108,12 @@ export async function getAll(db: IDBDatabase): Promise<ChatHistoryItem[]> {
   });
 }
 
+/**
+ * Upsert a chat. Ownership is sticky: an already stored record always keeps the
+ * owner it was created with (a chat started under user A can never silently
+ * become a guest chat - or vice versa - by editing it in another scope). New
+ * records are stamped with the currently active owner (account or guest).
+ */
 export async function setMessages(
   db: IDBDatabase,
   id: string,
@@ -80,17 +132,57 @@ export async function setMessages(
       return;
     }
 
-    const request = store.put({
-      id,
-      messages,
-      urlId,
-      description,
-      timestamp: timestamp ?? new Date().toISOString(),
-      metadata,
-    });
+    const storedAt = timestamp ?? new Date().toISOString();
+    const getRequest = store.get(id);
 
-    request.onsuccess = () => resolve();
+    getRequest.onerror = () => reject(getRequest.error);
+
+    getRequest.onsuccess = () => {
+      const existing = getRequest.result as ChatHistoryItem | undefined;
+      const owner =
+        existing && existing.ownerType !== undefined
+          ? { ownerType: existing.ownerType, ownerId: existing.ownerId ?? null }
+          : currentChatOwner();
+
+      const record: ChatHistoryItem = {
+        id,
+        messages,
+        urlId,
+        description,
+        timestamp: storedAt,
+        metadata,
+        ownerType: owner.ownerType,
+        ownerId: owner.ownerId,
+      };
+
+      // A guest chat that an account already copied (migratedTo) must keep its
+      // claim stamp, even when the guest later appends messages to it.
+      if (Array.isArray(existing?.migratedTo) && existing!.migratedTo.length > 0) {
+        record.migratedTo = existing!.migratedTo;
+      }
+
+      store.put(record);
+    };
+
+    transaction.onerror = () => reject(transaction.error);
+    transaction.oncomplete = () => resolve();
+  });
+}
+
+/**
+ * Store a chat record verbatim (including owner fields). Used by cloud sync to
+ * (re)write records that belong to the current account and by guest migration
+ * to mark a guest record as claimed.
+ */
+export async function putChat(db: IDBDatabase, item: ChatHistoryItem): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction('chats', 'readwrite');
+    const store = transaction.objectStore('chats');
+    const request = store.put(item);
+
     request.onerror = () => reject(request.error);
+    transaction.onerror = () => reject(transaction.error);
+    transaction.oncomplete = () => resolve();
   });
 }
 
@@ -258,7 +350,7 @@ export async function createChatFromMessages(
   messages: Message[],
   metadata?: IChatMetadata,
 ): Promise<string> {
-  const newId = await getNextId(db);
+  const newId = newChatId();
   const newUrlId = await getUrlId(db, newId); // Get a new urlId for the duplicated chat
 
   await setMessages(
@@ -285,7 +377,8 @@ export async function updateChatDescription(db: IDBDatabase, id: string, descrip
     throw new Error('Description cannot be empty');
   }
 
-  await setMessages(db, id, chat.messages, chat.urlId, description, chat.timestamp, chat.metadata);
+  // Bump updated_at so a rename wins the last-write-wins merge on other devices.
+  await setMessages(db, id, chat.messages, chat.urlId, description, new Date().toISOString(), chat.metadata);
 }
 
 export async function updateChatMetadata(
@@ -313,11 +406,28 @@ export async function getSnapshot(db: IDBDatabase, chatId: string): Promise<Snap
   });
 }
 
-export async function setSnapshot(db: IDBDatabase, chatId: string, snapshot: Snapshot): Promise<void> {
+/**
+ * Persist a snapshot for a chat. Snapshots stay local but are stamped with the
+ * same ownership as their chat record; consumers only restore a snapshot after
+ * the owning chat passed the active-scope check (see useChatHistory).
+ */
+export async function setSnapshot(
+  db: IDBDatabase,
+  chatId: string,
+  snapshot: Snapshot,
+  owner?: { ownerType: ChatOwnerType; ownerId: string | null },
+): Promise<void> {
+  const resolvedOwner = owner ?? currentChatOwner();
+
   return new Promise((resolve, reject) => {
     const transaction = db.transaction('snapshots', 'readwrite');
     const store = transaction.objectStore('snapshots');
-    const request = store.put({ chatId, snapshot });
+    const request = store.put({
+      chatId,
+      snapshot,
+      ownerType: resolvedOwner.ownerType,
+      ownerId: resolvedOwner.ownerId,
+    });
 
     request.onsuccess = () => resolve();
     request.onerror = () => reject(request.error);
